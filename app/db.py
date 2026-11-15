@@ -47,6 +47,34 @@ CREATE TABLE IF NOT EXISTS observations (
 
 CREATE INDEX IF NOT EXISTS idx_obs_msg
     ON observations (station_id, boot_id, msg_id);
+
+-- 小时核定批次。封存时把该小时 60 个分钟的观测复制到 sealed_observations，
+-- 之后批次是否可下载只由 status 决定；一旦 invalid 永不自动恢复。
+CREATE TABLE IF NOT EXISTS hourly_batches (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    station_id    INTEGER NOT NULL,
+    hour_start    TEXT    NOT NULL,  -- 如 2026-11-14T22:00:00Z
+    hour_end      TEXT    NOT NULL,  -- 该小时之后的下一个整点
+    -- sealed: 已封存可下载; invalid: 永久失效不可下载
+    status        TEXT    NOT NULL DEFAULT 'sealed'
+                  CHECK (status IN ('sealed', 'invalid')),
+    created_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    invalidated_at TEXT,
+    invalid_reason TEXT,
+    UNIQUE (station_id, hour_start)
+);
+
+-- 封存快照：批次 CSV 的专属内容，不随之后观测变化。
+CREATE TABLE IF NOT EXISTS sealed_observations (
+    batch_id    INTEGER NOT NULL
+                REFERENCES hourly_batches(id) ON DELETE CASCADE,
+    observed_at TEXT    NOT NULL,
+    level_m     REAL    NOT NULL,
+    PRIMARY KEY (batch_id, observed_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_batches_station
+    ON hourly_batches (station_id, hour_start);
 """
 
 

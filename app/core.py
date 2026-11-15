@@ -25,8 +25,9 @@ import base64
 import binascii
 import hashlib
 import json
+import math
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 REQUIRED_FIELDS = (
     "station_id",
@@ -126,6 +127,8 @@ def parse_tide_csv(data: bytes) -> list[tuple[str, float]]:
             level = float(parts[1])
         except ValueError:
             raise ValueError(f"第 {lineno} 行潮位不是数值: {parts[1]!r}") from None
+        if not math.isfinite(level):
+            raise ValueError(f"第 {lineno} 行潮位不是有限数值: {parts[1]!r}")
         obs.append((dt.strftime("%Y-%m-%dT%H:%M:00Z"), level))
 
     if not obs:
@@ -141,6 +144,220 @@ def _flag_pending(con: sqlite3.Connection, key: tuple, reason: str) -> None:
         (reason, *key),
     )
     con.execute(f"DELETE FROM observations WHERE {MSG_KEY}", key)
+
+
+def _batch_first_problem(con: sqlite3.Connection, station_ids: list[int]) -> dict[int, str]:
+    """比较封存快照与当前已确认观测，返回 {batch_id: 首个问题}。
+
+    只有 sealed 批次会被返回；invalid 批次永不修复。
+    """
+    ids = sorted({s for s in station_ids})
+    if not ids:
+        return {}
+    marks = ",".join("?" * len(ids))
+    rows = con.execute(
+        "SELECT b.id, s.observed_at, s.level_m AS sealed_level,"
+        "       o.level_m AS current_level"
+        " FROM hourly_batches b"
+        " JOIN sealed_observations s ON s.batch_id=b.id"
+        " LEFT JOIN observations o"
+        "   ON o.station_id=b.station_id AND o.observed_at=s.observed_at"
+        f" WHERE b.status='sealed' AND b.station_id IN ({marks})"
+        " ORDER BY b.id, s.observed_at",
+        ids,
+    ).fetchall()
+    first: dict[int, str] = {}
+    for row in rows:
+        if row["current_level"] is None:
+            reason = f"封存分钟 {row['observed_at']} 缺失"
+        elif row["current_level"] != row["sealed_level"]:
+            # SQLite REAL 与 Python float 往返无损，按精确值比较
+            reason = (f"封存分钟 {row['observed_at']} 潮位变化："
+                      f"{row['sealed_level']!r} -> {row['current_level']!r}")
+        else:
+            continue
+        first.setdefault(row["id"], reason)
+    return first
+
+
+def _invalidate_batches(con: sqlite3.Connection, first: dict[int, str]) -> list[dict]:
+    """把批次置为永久失效；仅 sealed -> invalid，不回退、不自动恢复。"""
+    out = []
+    for batch_id, reason in first.items():
+        con.execute(
+            "UPDATE hourly_batches SET status='invalid', invalid_reason=?,"
+            " invalidated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+            " WHERE id=? AND status='sealed'",
+            (reason, batch_id),
+        )
+        out.append({"batch_id": batch_id, "reason": reason})
+    return out
+
+
+def _validate_after_write(con: sqlite3.Connection, station_ids) -> list[dict]:
+    """写事务提交前统一核对批次。
+
+    在整批上传的最终状态上比较，而不是逐行比较：同一批上传里某分钟
+    先被撤下、后又被相同值补回时，封存批次不受影响。
+    """
+    return _invalidate_batches(con, _batch_first_problem(con, list(station_ids)))
+
+
+def parse_hour(value: str) -> tuple[str, str]:
+    """把小时输入规范化为 (hour_start, hour_end)，均为 ISO UTC 整点字符串。
+
+    接受 `2026-11-14T22:00:00Z`、`2026-11-14T22:00Z`、`2026-11-14 22:00`
+    等写法；带时区偏移时先换算到 UTC。分钟/秒必须为 0。
+    """
+    if not isinstance(value, str):
+        raise ValueError("小时必须是字符串")
+    text = value.strip()
+    if not text:
+        raise ValueError("小时不能为空")
+
+    iso = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+    try:
+        dt = datetime.fromisoformat(iso)
+    except ValueError:
+        raise ValueError("小时格式错误，应为 YYYY-MM-DDTHH:00:00Z") from None
+    # 必须有明确的小时部分（拒绝只有日期的输入）
+    time_part = text[10:].lstrip(" T")
+    if not time_part:
+        raise ValueError("小时格式错误，请同时给出整点小时")
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc)
+    # 换算到 UTC 后再检查整点：+05:45 等偏移换算后可能不再对齐整点
+    if dt.minute or dt.second or dt.microsecond:
+        raise ValueError("小时必须对齐到 UTC 整点（分、秒为 0）")
+    start = dt.strftime("%Y-%m-%dT%H:00:00Z")
+    end = (dt + timedelta(hours=1)).strftime("%Y-%m-%dT%H:00:00Z")
+    return start, end
+
+
+def _hour_minutes(hour_start: str) -> list[str]:
+    start = datetime.strptime(hour_start, "%Y-%m-%dT%H:%M:%SZ")
+    return [(start + timedelta(minutes=i)).strftime("%Y-%m-%dT%H:%M:00Z")
+            for i in range(60)]
+
+
+def _batch_dict(row) -> dict:
+    return {
+        "id": row["id"],
+        "station_id": row["station_id"],
+        "hour": row["hour_start"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "invalidated_at": row["invalidated_at"],
+        "invalid_reason": row["invalid_reason"],
+        "minutes": row["minutes"],
+        "download_url": f"/api/hourly-batches/{row['id']}/csv",
+    }
+
+
+_BATCH_SELECT = (
+    "SELECT b.*,"
+    " (SELECT COUNT(*) FROM sealed_observations s WHERE s.batch_id=b.id) AS minutes"
+    " FROM hourly_batches b"
+)
+
+
+def seal_hourly_batch(con: sqlite3.Connection, station_id: int, hour: str) -> dict:
+    """小时内 60 个整分钟均有已确认观测时封存批次；否则不产生批次。"""
+    hour_start, hour_end = parse_hour(hour)
+    con.execute("BEGIN IMMEDIATE")
+    batch_id = None
+    try:
+        existing = con.execute(
+            _BATCH_SELECT + " WHERE b.station_id=? AND b.hour_start=?",
+            (station_id, hour_start),
+        ).fetchone()
+        if existing is not None:
+            con.execute("ROLLBACK")
+            return {"status": "exists", "batch": _batch_dict(existing)}
+
+        rows = con.execute(
+            "SELECT observed_at, level_m FROM observations"
+            " WHERE station_id=? AND observed_at>=? AND observed_at<?"
+            " ORDER BY observed_at",
+            (station_id, hour_start, hour_end),
+        ).fetchall()
+        levels = {r["observed_at"]: r["level_m"] for r in rows}
+        expected = _hour_minutes(hour_start)
+        missing = [ts for ts in expected if ts not in levels]
+        if missing:
+            con.execute("ROLLBACK")
+            return {"status": "incomplete", "hour": hour_start,
+                    "present": len(levels), "required": len(expected),
+                    "missing": missing}
+
+        cur = con.execute(
+            "INSERT INTO hourly_batches (station_id, hour_start, hour_end)"
+            " VALUES (?, ?, ?)",
+            (station_id, hour_start, hour_end),
+        )
+        batch_id = cur.lastrowid
+        con.executemany(
+            "INSERT INTO sealed_observations (batch_id, observed_at, level_m)"
+            " VALUES (?, ?, ?)",
+            [(batch_id, ts, levels[ts]) for ts in expected],
+        )
+        con.execute("COMMIT")
+    except sqlite3.IntegrityError:
+        # 另一进程刚封存了同一小时：回滚后返回既有批次（幂等）
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        existing = con.execute(
+            _BATCH_SELECT + " WHERE b.station_id=? AND b.hour_start=?",
+            (station_id, hour_start),
+        ).fetchone()
+        if existing is None:
+            raise
+        return {"status": "exists", "batch": _batch_dict(existing)}
+    except BaseException:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        raise
+    row = con.execute(_BATCH_SELECT + " WHERE b.id=?", (batch_id,)).fetchone()
+    return {"status": "sealed", "batch": _batch_dict(row)}
+
+
+def list_hourly_batches(con: sqlite3.Connection, station_id: int | None = None) -> list[dict]:
+    sql = _BATCH_SELECT
+    args: list = []
+    if station_id is not None:
+        sql += " WHERE b.station_id=?"
+        args.append(station_id)
+    sql += " ORDER BY b.station_id, b.hour_start"
+    return [_batch_dict(row) for row in con.execute(sql, args).fetchall()]
+
+
+def hourly_batch_csv(con: sqlite3.Connection, batch_id: int) -> dict | None:
+    """可下载批次的 CSV 内容；失效或不存在时返回 None。
+
+    只读取封存快照，绝不回读当前观测：批次失效后内容不再提供。
+    """
+    rows = con.execute(
+        "SELECT b.id, b.station_id, b.hour_start, b.status, b.created_at,"
+        "       b.invalidated_at, b.invalid_reason, s.observed_at, s.level_m,"
+        "       (SELECT COUNT(*) FROM sealed_observations x"
+        "         WHERE x.batch_id=b.id) AS minutes"
+        " FROM hourly_batches b"
+        " LEFT JOIN sealed_observations s ON s.batch_id=b.id"
+        " WHERE b.id=? AND b.status='sealed'"
+        " ORDER BY s.observed_at",
+        (batch_id,),
+    ).fetchall()
+    if not rows:
+        return None
+    first = rows[0]
+    if len(rows) != first["minutes"] or any(r["observed_at"] is None for r in rows):
+        return None
+    lines = ["station_id,observed_at,level_m"]
+    lines += [f"{first['station_id']},{r['observed_at']},{r['level_m']}" for r in rows]
+    name = ("hourly_%s_%s.csv"
+            % (first["station_id"], first["hour_start"].replace(":", "").replace("-", "")))
+    return {"batch": _batch_dict(first), "filename": name,
+            "csv": "\n".join(lines) + "\n"}
 
 
 def ingest_record(con: sqlite3.Connection, rec: dict) -> dict:
@@ -220,9 +437,12 @@ def ingest_record(con: sqlite3.Connection, rec: dict) -> dict:
         return {**base, "status": "conflict", "detail": reason}
 
     con.executemany(
-        "INSERT OR IGNORE INTO observations"
+        "INSERT INTO observations"
         " (station_id, observed_at, level_m, boot_id, msg_id)"
-        " VALUES (?, ?, ?, ?, ?)",
+        " VALUES (?, ?, ?, ?, ?)"
+        " ON CONFLICT (station_id, observed_at) DO UPDATE SET"
+        " level_m=excluded.level_m, boot_id=excluded.boot_id, msg_id=excluded.msg_id"
+        " WHERE observations.level_m IS NOT excluded.level_m",
         [(key[0], ts, level, key[1], key[2]) for ts, level in obs],
     )
     con.execute(
@@ -254,11 +474,16 @@ def ingest_ndjson(con: sqlite3.Connection, text: str) -> dict:
             outcome["line"] = lineno
             results.append(outcome)
             counts[outcome["status"]] = counts.get(outcome["status"], 0) + 1
+        # 在整批的最终状态上核对封存批次：批内中间态（如先撤后补）不算失效
+        impacted = _validate_after_write(
+            con, {r["station_id"] for r in results if "station_id" in r}
+        )
         con.execute("COMMIT")
     except BaseException:
         con.execute("ROLLBACK")
         raise
-    return {"lines": len(results), "counts": counts, "results": results}
+    return {"lines": len(results), "counts": counts, "results": results,
+            "invalidated_batches": impacted}
 
 
 def list_messages(con: sqlite3.Connection) -> list[dict]:
@@ -294,16 +519,21 @@ def list_messages(con: sqlite3.Connection) -> list[dict]:
     return out
 
 
-def reset_message(con: sqlite3.Connection, station_id: int, boot_id: int, msg_id: int) -> bool:
-    """删除一个报文及其段与观测（待核处理后重新采集）。"""
+def reset_message(con: sqlite3.Connection, station_id: int, boot_id: int, msg_id: int) -> dict:
+    """删除一个报文及其段与观测（待核处理后重新采集）。
+
+    返回 {"deleted": 是否存在, "invalidated_batches": [...]}。删观测后若有
+    封存分钟缺失，相应批次在同一事务内永久失效。
+    """
     key = (station_id, boot_id, msg_id)
     con.execute("BEGIN IMMEDIATE")
     try:
         cur = con.execute(f"DELETE FROM messages WHERE {MSG_KEY}", key)
         con.execute(f"DELETE FROM segments WHERE {MSG_KEY}", key)
         con.execute(f"DELETE FROM observations WHERE {MSG_KEY}", key)
+        impacted = _validate_after_write(con, [station_id])
         con.execute("COMMIT")
     except BaseException:
         con.execute("ROLLBACK")
         raise
-    return cur.rowcount > 0
+    return {"deleted": cur.rowcount > 0, "invalidated_batches": impacted}

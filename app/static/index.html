@@ -24,18 +24,21 @@
   .tag.published { background:#e2f4e8; color:var(--ok); }
   .tag.collecting { background:#fdf3e0; color:var(--warn); }
   .tag.pending_review { background:#fde6e9; color:var(--bad); }
+  .tag.sealed { background:#e2f4e8; color:var(--ok); }
+  .tag.invalid { background:#fde6e9; color:var(--bad); }
   .muted { color:var(--muted); }
   .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-  #upload-result { margin-top:10px; font-size:13px; white-space:pre-wrap; }
+  #upload-result, #seal-result { margin-top:10px; font-size:13px; white-space:pre-wrap; }
   details { margin-top:8px; }
   input[type=text], input[type=number] { padding:6px 8px; border:1px solid var(--line); border-radius:5px; }
   a.dl { color:#0e3a5d; }
+  .disabled { color:#9aa8b5; }
 </style>
 </head>
 <body>
 <header>
   <h1>沿海潮位卫星短报文采集</h1>
-  <p>上传网关 NDJSON（拆段 / 乱序 / 重投）→ 按 站号+启动号+报文号 归组 → 组报校验 → 发布分钟潮位</p>
+  <p>上传网关 NDJSON（拆段 / 乱序 / 重投）→ 按 站号+启动号+报文号 归组 → 组报校验 → 发布分钟潮位 → 小时核定封存</p>
 </header>
 <main>
   <section>
@@ -60,7 +63,25 @@
   </section>
 
   <section>
-    <h2>3. 已确认观测</h2>
+    <h2>3. 小时核定与封存批次 <button class="ghost" id="btn-batch-refresh">刷新</button></h2>
+    <div class="row">
+      <label>站号 <input type="number" id="seal-station" placeholder="如 101" style="width:100px"></label>
+      <label>UTC 小时 <input type="text" id="seal-hour" placeholder="2026-11-14T22:00:00Z" style="width:210px"></label>
+      <button id="btn-seal">核定并封存</button>
+      <span class="muted">仅当该小时 60 个整分钟均有已确认潮位时封存；封存后任一分钟缺失或潮位变化，批次永久失效</span>
+    </div>
+    <div id="seal-result"></div>
+    <table style="margin-top:10px">
+      <thead><tr>
+        <th>批次</th><th>站号</th><th>UTC 小时</th><th>状态</th><th>分钟数</th>
+        <th>封存时间</th><th>失效时间</th><th>失效原因</th><th>专属 CSV</th>
+      </tr></thead>
+      <tbody id="batch-body"><tr><td colspan="9" class="muted">加载中…</td></tr></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>4. 已确认观测</h2>
     <div class="row">
       <label>站号过滤 <input type="number" id="station-filter" placeholder="全部" style="width:90px"></label>
       <button class="ghost" id="btn-preview">预览</button>
@@ -77,6 +98,7 @@
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const STATUS_TEXT = {collecting:'收集中', published:'已发布', pending_review:'待核'};
+const BATCH_TEXT = {sealed:'已封存·可下载', invalid:'已永久失效'};
 
 $('btn-upload').onclick = async () => {
   const f = $('file').files[0];
@@ -92,8 +114,12 @@ $('btn-upload').onclick = async () => {
     let out = `共 ${data.lines} 行 → 入库 ${c.stored||0}，发布 ${c.published||0}，重投忽略 ${c.duplicate||0}，冲突 ${c.conflict||0}，待核忽略 ${c.ignored||0}，错误 ${c.error||0}`;
     const bad = data.results.filter(r => r.status === 'conflict' || r.status === 'error');
     if (bad.length) out += '\n' + bad.map(r => `  行${r.line}: [${r.status}] ${r.detail}`).join('\n');
+    if (data.invalidated_batches.length) {
+      out += '\n本次上传导致批次永久失效：' + data.invalidated_batches
+        .map(b => `#${b.batch_id}（${b.reason}）`).join('；');
+    }
     $('upload-result').textContent = out;
-    refreshMessages(); loadObservations();
+    refreshMessages(); loadBatches(); loadObservations();
   } catch (e) { $('upload-result').textContent = '上传出错: ' + e; }
 };
 
@@ -115,11 +141,61 @@ async function refreshMessages() {
 }
 
 window.resetMsg = async (s, b, m) => {
-  if (!confirm(`复位报文 站${s}/启动${b}/报文${m}？其段与观测将被删除，可重新采集。`)) return;
+  if (!confirm(`复位报文 站${s}/启动${b}/报文${m}？其段与观测将被删除，可重新采集。\n若封存批次因此缺分钟，批次将永久失效。`)) return;
   const resp = await fetch(`/api/messages/${s}/${b}/${m}`, {method:'DELETE'});
-  if (!resp.ok) alert('复位失败');
-  refreshMessages(); loadObservations();
+  if (!resp.ok) { alert('复位失败'); return; }
+  const data = await resp.json();
+  if (data.invalidated_batches.length) {
+    alert('批次已永久失效：' + data.invalidated_batches
+      .map(x => `#${x.batch_id}（${x.reason}）`).join('；'));
+  }
+  refreshMessages(); loadBatches(); loadObservations();
 };
+
+$('btn-seal').onclick = async () => {
+  const station = $('seal-station').value.trim();
+  const hour = $('seal-hour').value.trim();
+  const out = $('seal-result');
+  if (station === '' || hour === '') { out.textContent = '请填写站号与 UTC 小时'; return; }
+  out.textContent = '核定中…';
+  try {
+    const resp = await fetch('/api/hourly-batches', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({station_id: Number(station), hour})
+    });
+    const data = await resp.json();
+    if (resp.status === 409) {
+      const shown = data.missing.slice(0, 8).join(', ');
+      const more = data.missing.length > 8 ? ` … 共 ${data.missing.length} 分钟` : '';
+      out.textContent = `未封存：${data.detail}（缺 ${shown}${more}）`;
+    } else if (!resp.ok) {
+      out.textContent = '核定失败: ' + (typeof data.detail === 'string' ? data.detail : resp.status);
+    } else {
+      const b = data.batch;
+      out.textContent = (data.status === 'sealed' ? '已封存批次 ' : '该小时已封存，批次 ')
+        + `#${b.id}（站${b.station_id} ${b.hour}，${b.minutes} 分钟，${BATCH_TEXT[b.status] || b.status}）`;
+    }
+    loadBatches();
+  } catch (e) { out.textContent = '核定出错: ' + e; }
+};
+
+async function loadBatches() {
+  const resp = await fetch('/api/hourly-batches');
+  const {batches} = await resp.json();
+  const tb = $('batch-body');
+  if (!batches.length) { tb.innerHTML = '<tr><td colspan="9" class="muted">暂无批次</td></tr>'; return; }
+  tb.innerHTML = batches.map(b => `<tr>
+    <td>#${b.id}</td><td>${b.station_id}</td><td>${b.hour}</td>
+    <td><span class="tag ${b.status}">${BATCH_TEXT[b.status] || b.status}</span></td>
+    <td>${b.minutes}/60</td>
+    <td>${esc(b.created_at)}</td>
+    <td>${b.invalidated_at ? esc(b.invalidated_at) : '—'}</td>
+    <td>${b.invalid_reason ? esc(b.invalid_reason) : '—'}</td>
+    <td>${b.status === 'sealed'
+        ? `<a class="dl" href="${b.download_url}" download>下载 CSV</a>`
+        : '<span class="disabled">不可下载</span>'}</td>
+  </tr>`).join('');
+}
 
 function stationParam() {
   const v = $('station-filter').value.trim();
@@ -137,8 +213,9 @@ async function loadObservations() {
 }
 
 $('btn-refresh').onclick = refreshMessages;
+$('btn-batch-refresh').onclick = loadBatches;
 $('btn-preview').onclick = loadObservations;
-refreshMessages(); loadObservations();
+refreshMessages(); loadBatches(); loadObservations();
 </script>
 </body>
 </html>
